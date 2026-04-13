@@ -3,13 +3,16 @@
 telegram_signals.py — Hardened P8_FADE_ANY_EXTREME signal bot for Telegram.
 
 Setup:
-1. Create .env file with:
+1. Create .env file:
    TELEGRAM_BOT_TOKEN=123456:ABC-your-token
    TELEGRAM_CHAT_ID=987654321
 
 2. Run:
-   python telegram_signals.py --sim    # simulation
-   python telegram_signals.py --live   # live Polymarket API
+   python telegram_signals.py --sim
+   python telegram_signals.py --live
+
+Commands (send to your bot on Telegram):
+   /status  — get uptime, trade count, PnL, open signals
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import argparse
 import math
 import os
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -25,7 +29,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# Load .env before anything else
 def _load_dotenv() -> None:
     env_path = Path(__file__).parent / ".env"
     if not env_path.exists():
@@ -54,7 +57,7 @@ MIN_MTC       = 1.0
 MAX_MTC       = 10.0
 MIN_PRICE     = 0.01
 MAX_PRICE     = 0.99
-POLL_SEC      = 30
+POLL_SEC      = 10
 SIM_SPEED     = 0.10
 HEARTBEAT_SEC = 3600
 
@@ -118,7 +121,7 @@ def _http_get(url, params=None, timeout=6.0):
             if attempt < HTTP_RETRIES:
                 print(f"  [HTTP] retry {attempt+1}: {exc}")
             else:
-                print(f"  [HTTP] failed after {HTTP_RETRIES+1} attempts: {exc}")
+                print(f"  [HTTP] failed: {exc}")
     return None
 
 def _tg_send(text, retries=TG_RETRIES):
@@ -135,9 +138,8 @@ def _tg_send(text, retries=TG_RETRIES):
             )
             if r.status_code == 200:
                 return True
-            print(f"  [Telegram] HTTP {r.status_code}: {r.text[:120]}")
         except Exception as exc:
-            print(f"  [Telegram] send error (attempt {attempt+1}): {exc}")
+            print(f"  [Telegram] error (attempt {attempt+1}): {exc}")
     return False
 
 def _tg_validate():
@@ -156,15 +158,12 @@ def _tg_validate():
         return False
 
 def _fmt_signal(sig):
-    trade_px   = (1.0 - sig.entry_price) if sig.side == "NO" else sig.entry_price
-    trade_px   = max(trade_px, MIN_PRICE)
+    trade_px   = max((1.0 - sig.entry_price) if sig.side == "NO" else sig.entry_price, MIN_PRICE)
     max_payout = POSITION_USD / trade_px
-    multiplier = max_payout / POSITION_USD
     return (
         f"\u26a1 <b>SIGNAL — BUY {sig.side} on {sig.coin}</b>\n"
-        f"YES price : {sig.entry_price:.3f}  \u2192  "
-        f"{'NO' if sig.side == 'NO' else 'YES'} price : {trade_px:.3f}\n"
-        f"Max payout: <b>${max_payout:.2f}</b>  ({multiplier:.1f}\u00d7 your stake)\n"
+        f"YES price : {sig.entry_price:.3f}  \u2192  {'NO' if sig.side == 'NO' else 'YES'} price : {trade_px:.3f}\n"
+        f"Max payout: <b>${max_payout:.2f}</b>  ({max_payout/POSITION_USD:.1f}\u00d7 your stake)\n"
         f"Time left : {sig.minutes_to_close:.1f} min\n"
         f"Stake     : ${POSITION_USD:.2f}\n"
         f"<i>{sig.dt}</i>"
@@ -185,11 +184,9 @@ def _fmt_session_end(trades):
     wins  = sum(1 for t in trades if t.win)
     total = sum(t.net_pnl for t in trades)
     wr    = wins / len(trades) * 100
-    pf_raw = (
-        sum(t.gross_pnl for t in trades if t.win) /
-        abs(sum(t.gross_pnl for t in trades if not t.win) or 1)
-    )
-    pf = f"{pf_raw:.2f}" if math.isfinite(pf_raw) else "\u221e"
+    g_w   = sum(t.gross_pnl for t in trades if t.win)
+    g_l   = abs(sum(t.gross_pnl for t in trades if not t.win) or 1)
+    pf    = f"{g_w/g_l:.2f}" if math.isfinite(g_w/g_l) else "\u221e"
     return (
         f"\U0001f4ca <b>Session complete — P8_FADE_ANY_EXTREME</b>\n"
         f"Trades : {len(trades)}  (wins {wins} / losses {len(trades)-wins})\n"
@@ -201,18 +198,79 @@ def _fmt_session_end(trades):
 class _Board:
     def __init__(self):
         self.trades: List[ClosedTrade] = []
-    def add(self, t):
-        self.trades.append(t)
+    def add(self, t): self.trades.append(t)
     @property
     def n(self): return len(self.trades)
     @property
     def total(self): return sum(t.net_pnl for t in self.trades)
 
+
+class _CommandListener(threading.Thread):
+    """Background thread — polls Telegram for /status command."""
+
+    def __init__(self, bot):
+        super().__init__(daemon=True)
+        self.bot        = bot
+        self.offset     = 0
+        self.start_time = time.time()
+
+    def run(self):
+        while True:
+            try:
+                self._poll()
+            except Exception:
+                pass
+            time.sleep(3)
+
+    def _poll(self):
+        r = httpx.get(
+            f"{TG_API}/bot{BOT_TOKEN}/getUpdates",
+            params={"offset": self.offset, "timeout": 2},
+            timeout=6.0,
+        )
+        if r.status_code != 200:
+            return
+        for upd in r.json().get("result") or []:
+            self.offset = upd["update_id"] + 1
+            msg  = upd.get("message") or {}
+            text = (msg.get("text") or "").strip().lower().split()[0] if msg.get("text") else ""
+            if text == "/status":
+                self._reply_status(msg.get("chat", {}).get("id"))
+
+    def _reply_status(self, chat_id):
+        if not chat_id:
+            return
+        b      = self.bot.board
+        up     = int(time.time() - self.start_time)
+        h, m, s = up // 3600, (up % 3600) // 60, up % 60
+        wins   = sum(1 for t in b.trades if t.win)
+        wr     = f"{wins/b.n*100:.1f}%" if b.n else "n/a"
+        text = (
+            f"\U0001f4ca <b>Bot Status</b>\n"
+            f"Uptime  : {h}h {m}m {s}s\n"
+            f"Trades  : {b.n}  (\u2705 {wins} / \u274c {b.n - wins})\n"
+            f"Win %   : {wr}\n"
+            f"Net PnL : <b>${b.total:>+.2f}</b>\n"
+            f"Open    : {len(self.bot._open_sigs)} signal(s)\n"
+            f"Poll    : every {POLL_SEC}s  |  Mode: LIVE"
+        )
+        try:
+            httpx.post(
+                f"{TG_API}/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=8.0,
+            )
+        except Exception:
+            pass
+
+
 class TelegramSignalBot:
+
     def __init__(self, mode="live", speed=SIM_SPEED):
-        self.mode  = mode
-        self.speed = speed
-        self.board = _Board()
+        self.mode       = mode
+        self.speed      = speed
+        self.board      = _Board()
+        self._open_sigs: Dict[str, Signal] = {}
 
     def _pause(self):
         if self.speed > 0:
@@ -221,46 +279,43 @@ class TelegramSignalBot:
     def _on_signal(self, sig):
         trade_px = max((1 - sig.entry_price) if sig.side == "NO" else sig.entry_price, MIN_PRICE)
         mp = POSITION_USD / trade_px
-        print(f"  \u26a1  {sig.dt}  {sig.coin:<4s}  YES={sig.entry_price:.3f}  →  BUY {sig.side} @ {trade_px:.3f}  (max ${mp:.2f})")
+        print(f"  \u26a1  {sig.dt}  {sig.coin:<4s}  YES={sig.entry_price:.3f}  \u2192  BUY {sig.side} @ {trade_px:.3f}  (max ${mp:.2f})")
         if _tg_send(_fmt_signal(sig)):
-            print("       \U0001f4f1 Telegram notification sent")
+            print("       \U0001f4f1 Telegram sent")
         self._pause()
 
     def _on_close(self, trade):
         self.board.add(trade)
         icon = "\u2713" if trade.win else "\u2717"
-        tag  = "WIN " if trade.win else "LOSS"
-        print(f"     {icon} {tag}  {trade.signal.coin:<4s}  → {trade.resolution}  net ${trade.net_pnl:>+.2f}  (roi {trade.roi_pct:>+.1f}%)")
+        print(f"     {icon} {'WIN ' if trade.win else 'LOSS'}  {trade.signal.coin:<4s}  \u2192 {trade.resolution}  net ${trade.net_pnl:>+.2f}")
         if _tg_send(_fmt_resolution(trade, self.board.total, self.board.n)):
-            print("       \U0001f4f1 Telegram notification sent")
+            print("       \U0001f4f1 Telegram sent")
         self._pause()
 
     def _header(self):
-        tg_ok = bool(BOT_TOKEN and CHAT_ID)
         print("=" * 72)
         print("  P8_FADE_ANY_EXTREME  \u00b7  Telegram Signal Bot  [HARDENED]")
-        print(f"  Signal  : YES > {SIGNAL_HIGH} → BUY NO  |  YES < {SIGNAL_LOW} → BUY YES")
-        print(f"  Window  : {MIN_MTC:.0f}–{MAX_MTC:.0f} min before close")
-        print(f"  Stake   : ${POSITION_USD:.2f}  |  Fee: {FEE_RATE*100:.0f}%")
-        print(f"  Mode    : {self.mode.upper()}")
-        if tg_ok:
+        print(f"  Signal  : YES > {SIGNAL_HIGH} \u2192 BUY NO  |  YES < {SIGNAL_LOW} \u2192 BUY YES")
+        print(f"  Window  : {MIN_MTC:.0f}\u2013{MAX_MTC:.0f} min  |  Poll: {POLL_SEC}s")
+        print(f"  Stake   : ${POSITION_USD:.2f}  |  Fee: {FEE_RATE*100:.0f}%  |  Mode: {self.mode.upper()}")
+        if BOT_TOKEN and CHAT_ID:
             print(f"  Telegram: \u2713 configured  (chat_id={CHAT_ID})")
+            print(f"  Commands: send /status to your bot for a live health check")
         else:
-            print("  Telegram: \u2717 NOT configured — signals printed to terminal only")
-            print("            Create .env with TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+            print("  Telegram: \u2717 NOT configured — create .env with token+chat_id")
         print("=" * 72)
 
     def run(self):
         self._header()
         if BOT_TOKEN and CHAT_ID:
             if not _tg_validate():
-                print("\n  ERROR: Telegram credentials are invalid. Check .env and try again.")
+                print("\n  ERROR: Telegram credentials invalid. Check .env.")
                 sys.exit(1)
             _tg_send(
                 f"\U0001f680 <b>P8_FADE_ANY_EXTREME bot started</b>\n"
-                f"Monitoring BTC/ETH/SOL/XRP — "
-                f"signal window: last {MIN_MTC:.0f}–{MAX_MTC:.0f} min before close\n"
-                f"Stake: ${POSITION_USD:.2f}  |  Mode: {self.mode.upper()}"
+                f"Monitoring BTC/ETH/SOL/XRP — window: {MIN_MTC:.0f}\u2013{MAX_MTC:.0f} min\n"
+                f"Stake: ${POSITION_USD:.2f}  |  Mode: {self.mode.upper()}\n"
+                f"Send /status anytime for a health check"
             )
         try:
             if self.mode == "sim":
@@ -268,39 +323,30 @@ class TelegramSignalBot:
             else:
                 self._run_live()
         except KeyboardInterrupt:
-            print("\n  Stopped by user (Ctrl-C).")
+            print("\n  Stopped.")
             if BOT_TOKEN and CHAT_ID:
                 _tg_send(_fmt_session_end(self.board.trades))
         except Exception as exc:
-            print(f"\n  FATAL ERROR: {exc}")
-            print(traceback.format_exc())
+            print(f"\n  FATAL: {exc}\n{traceback.format_exc()}")
             if BOT_TOKEN and CHAT_ID:
-                _tg_send(
-                    f"\U0001f534 <b>Bot crashed!</b>\n"
-                    f"<code>{str(exc)[:300]}</code>\n"
-                    f"Restart with: systemctl restart polybot"
-                )
+                _tg_send(f"\U0001f534 <b>Bot crashed!</b>\n<code>{str(exc)[:300]}</code>\nRestart: systemctl restart polybot")
             sys.exit(1)
 
     def _run_sim(self):
-        print("\n  Loading synthetic dataset ... ", end="", flush=True)
+        print("\n  Loading synthetic dataset...", end="", flush=True)
         sys.path.insert(0, str(Path(__file__).parent))
         from polymarket_backtest import generate_synthetic_data
         markets, candles_map = generate_synthetic_data()
         markets.sort(key=lambda m: m.start_ts)
-        print(f"done  ({len(markets)} markets)\n")
+        print(f" done ({len(markets)} markets)\n")
         open_pos: Dict[str, Signal] = {}
         for mkt in markets:
             for c in (candles_map.get(mkt.condition_id) or []):
-                if not (MIN_MTC <= c.minutes_to_close <= MAX_MTC):
-                    continue
-                if not (MIN_PRICE <= c.price <= MAX_PRICE):
-                    continue
+                if not (MIN_MTC <= c.minutes_to_close <= MAX_MTC): continue
+                if not (MIN_PRICE <= c.price <= MAX_PRICE): continue
                 if (c.price > SIGNAL_HIGH or c.price < SIGNAL_LOW) and mkt.condition_id not in open_pos:
                     side = "NO" if c.price > SIGNAL_HIGH else "YES"
-                    sig  = Signal(condition_id=mkt.condition_id, coin=mkt.coin,
-                                  side=side, entry_price=c.price,
-                                  minutes_to_close=c.minutes_to_close, dt=c.dt, ts=c.ts)
+                    sig  = Signal(mkt.condition_id, mkt.coin, side, c.price, c.minutes_to_close, c.dt, c.ts)
                     open_pos[mkt.condition_id] = sig
                     self._on_signal(sig)
             if mkt.condition_id in open_pos and mkt.resolution in ("YES", "NO"):
@@ -309,20 +355,21 @@ class TelegramSignalBot:
                 self._on_close(ClosedTrade(sig, mkt.resolution, win, gross, net, roi))
         if BOT_TOKEN and CHAT_ID:
             _tg_send(_fmt_session_end(self.board.trades))
-        print(f"\n  Session complete — {self.board.n} trades  |  net ${self.board.total:>+.2f}")
+        print(f"\n  Done — {self.board.n} trades  |  net ${self.board.total:>+.2f}")
 
     def _run_live(self):
-        print(f"\n  Polling every {POLL_SEC}s — Ctrl-C to stop\n")
-        open_sigs: Dict[str, Signal] = {}
+        print(f"\n  Polling every {POLL_SEC}s — Ctrl-C to stop")
+        if BOT_TOKEN and CHAT_ID:
+            _CommandListener(self).start()
+            print("  /status command active — send it to your bot anytime\n")
+
+        open_sigs     = self._open_sigs
         sig_entry_ts: Dict[str, int] = {}
-        last_heartbeat = time.time()
-        scan = 0
+        last_hb       = time.time()
+        scan          = 0
 
         def _active(coin):
-            r = _http_get(f"{GAMMA_API}/markets", params={
-                "active": "true", "closed": "false",
-                "search": f"{coin} minute", "limit": 5,
-            })
+            r = _http_get(f"{GAMMA_API}/markets", params={"active": "true", "closed": "false", "search": f"{coin} minute", "limit": 5})
             if not r: return None
             try:
                 mkts = [m for m in r.json() if isinstance(m, dict)]
@@ -339,24 +386,21 @@ class TelegramSignalBot:
                 book = r.json()
                 bids = book.get("bids") or []
                 asks = book.get("asks") or []
-                if bids and asks:
-                    return (float(bids[0]["price"]) + float(asks[0]["price"])) / 2
+                if bids and asks: return (float(bids[0]["price"]) + float(asks[0]["price"])) / 2
                 return float((bids or asks)[0]["price"]) if (bids or asks) else None
             except Exception: return None
 
-        def _market_resolved(cid):
+        def _resolved(cid):
             r = _http_get(f"{GAMMA_API}/markets/{cid}")
             if not r: return None
             try:
-                data = r.json()
-                outcome = (data.get("outcome") or data.get("resolution") or data.get("winner") or "")
-                outcome = str(outcome).upper().strip()
-                if outcome in ("YES", "NO"): return outcome
-                if data.get("closed") or data.get("resolved"):
-                    for tok in (data.get("tokens") or []):
-                        o = str(tok.get("outcome") or "").upper().strip()
-                        if (tok.get("winner") or tok.get("winning")) and o in ("YES", "NO"):
-                            return o
+                d = r.json()
+                o = (d.get("outcome") or d.get("resolution") or d.get("winner") or "").upper().strip()
+                if o in ("YES", "NO"): return o
+                if d.get("closed") or d.get("resolved"):
+                    for tok in (d.get("tokens") or []):
+                        o2 = str(tok.get("outcome") or "").upper().strip()
+                        if (tok.get("winner") or tok.get("winning")) and o2 in ("YES", "NO"): return o2
             except Exception: pass
             return None
 
@@ -368,43 +412,30 @@ class TelegramSignalBot:
             now_ts = int(datetime.now(timezone.utc).timestamp())
             print(f"  [{_fmt_ts(now_ts)}]  scan #{scan}  (open: {len(open_sigs)})")
 
-            if time.time() - last_heartbeat >= HEARTBEAT_SEC:
-                _tg_send(
-                    f"\U0001f493 <b>Heartbeat</b> — bot is alive\n"
-                    f"Scan #{scan}  |  Open signals: {len(open_sigs)}\n"
-                    f"Net P&L so far: ${self.board.total:>+.2f}  ({self.board.n} closed trades)"
-                )
-                last_heartbeat = time.time()
+            if time.time() - last_hb >= HEARTBEAT_SEC:
+                _tg_send(f"\U0001f493 <b>Heartbeat</b> — bot alive\nScan #{scan}  |  Open: {len(open_sigs)}\nNet P&L: ${self.board.total:>+.2f}  ({self.board.n} trades)")
+                last_hb = time.time()
 
-            stale_cids = []
+            stale = []
             for cid, sig in list(open_sigs.items()):
-                age_min = (now_ts - sig.ts) / 60.0
-                if age_min > MAX_MTC + 5:
-                    outcome = _market_resolved(cid)
+                age = (now_ts - sig.ts) / 60.0
+                if age > MAX_MTC + 5:
+                    outcome = _resolved(cid)
                     if outcome:
-                        open_sigs.pop(cid, None)
-                        sig_entry_ts.pop(cid, None)
+                        open_sigs.pop(cid, None); sig_entry_ts.pop(cid, None)
                         win, gross, net, roi = compute_pnl(sig.side, sig.entry_price, outcome)
                         self._on_close(ClosedTrade(sig, outcome, win, gross, net, roi))
-                        print(f"    [resolved] {sig.coin} → {outcome}")
-                    elif age_min > MAX_MTC + 30:
-                        stale_cids.append(cid)
-
-            for cid in stale_cids:
-                sig = open_sigs.pop(cid, None)
-                sig_entry_ts.pop(cid, None)
+                    elif age > MAX_MTC + 30:
+                        stale.append(cid)
+            for cid in stale:
+                sig = open_sigs.pop(cid, None); sig_entry_ts.pop(cid, None)
                 if sig:
-                    print(f"    [stale] {sig.coin} removed after 30+ min")
-                    _tg_send(f"\u26a0\ufe0f <b>Stale signal removed</b> — {sig.coin}\n"
-                             f"Could not resolve after 30+ min.\n"
-                             f"Signal was: BUY {sig.side} @ {sig.entry_price:.3f}")
+                    _tg_send(f"\u26a0\ufe0f <b>Stale signal removed</b> — {sig.coin}\nNo resolution after 30+ min.")
 
             for coin in COINS:
                 mkt = _active(coin)
-                if not mkt:
-                    print(f"    {coin}: no active market")
-                    continue
-                tokens = mkt.get("tokens") or []
+                if not mkt: print(f"    {coin}: no active market"); continue
+                tokens  = mkt.get("tokens") or []
                 yes_tok = str(tokens[0].get("token_id") or tokens[0].get("tokenId") or "") if tokens else ""
                 if not yes_tok: continue
                 end_str = mkt.get("endDate") or mkt.get("end_date_iso") or ""
@@ -412,29 +443,18 @@ class TelegramSignalBot:
                     end_ts = int(datetime.fromisoformat(end_str.replace("Z", "+00:00")).timestamp())
                 except Exception: continue
                 mtc = (end_ts - now_ts) / 60.0
-                if mtc <= 0:
-                    print(f"    {coin}: expired (mtc={mtc:.1f})")
-                    continue
-                if not (MIN_MTC <= mtc <= MAX_MTC):
-                    print(f"    {coin}: mtc={mtc:.1f} — outside window")
-                    continue
+                if mtc <= 0: print(f"    {coin}: expired"); continue
+                if not (MIN_MTC <= mtc <= MAX_MTC): print(f"    {coin}: mtc={mtc:.1f} outside window"); continue
                 price = _midprice(yes_tok)
-                if price is None:
-                    print(f"    {coin}: no price")
-                    continue
-                if not (MIN_PRICE <= price <= MAX_PRICE):
-                    print(f"    {coin}: price {price:.4f} out of bounds")
-                    continue
-                cid = (mkt.get("conditionId") or mkt.get("condition_id") or mkt.get("id") or yes_tok)
+                if price is None: print(f"    {coin}: no price"); continue
+                if not (MIN_PRICE <= price <= MAX_PRICE): continue
+                cid = mkt.get("conditionId") or mkt.get("condition_id") or mkt.get("id") or yes_tok
                 print(f"    {coin}: YES={price:.3f}  mtc={mtc:.1f} min", end="")
                 if price > SIGNAL_HIGH or price < SIGNAL_LOW:
                     if cid not in open_sigs:
                         side = "NO" if price > SIGNAL_HIGH else "YES"
-                        sig  = Signal(condition_id=cid, coin=coin, side=side,
-                                      entry_price=price, minutes_to_close=round(mtc, 2),
-                                      dt=_fmt_ts(now_ts), ts=now_ts)
-                        open_sigs[cid] = sig
-                        sig_entry_ts[cid] = now_ts
+                        sig  = Signal(cid, coin, side, price, round(mtc, 2), _fmt_ts(now_ts), now_ts)
+                        open_sigs[cid] = sig; sig_entry_ts[cid] = now_ts
                         print(f"  \u26a1 SIGNAL")
                         self._on_signal(sig)
                     else:
@@ -442,14 +462,15 @@ class TelegramSignalBot:
                 else:
                     print()
 
-            print(f"  Next poll in {POLL_SEC}s ...\n")
+            print(f"  Next poll in {POLL_SEC}s...\n")
             time.sleep(POLL_SEC)
 
+
 def main():
-    ap = argparse.ArgumentParser(description="P8_FADE_ANY_EXTREME — Hardened Telegram signal bot")
+    ap = argparse.ArgumentParser(description="P8_FADE_ANY_EXTREME signal bot")
     grp = ap.add_mutually_exclusive_group()
-    grp.add_argument("--sim",  action="store_true", help="Simulation mode")
-    grp.add_argument("--live", action="store_true", help="Live Polymarket API")
+    grp.add_argument("--sim",  action="store_true")
+    grp.add_argument("--live", action="store_true")
     ap.add_argument("--speed", type=float, default=SIM_SPEED)
     args = ap.parse_args()
     TelegramSignalBot(mode="sim" if args.sim else "live", speed=args.speed).run()
