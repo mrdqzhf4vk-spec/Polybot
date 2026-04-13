@@ -2,7 +2,7 @@
 # setup_server.sh — Run this ONCE on a fresh VPS to install and start the bot.
 #
 # Usage:
-#   TELEGRAM_BOT_TOKEN="xxx" TELEGRAM_CHAT_ID="yyy" REPO_URL="https://github.com/mrdqzhf4vk-spec/polybot.git" bash deploy/setup_server.sh
+#   TELEGRAM_BOT_TOKEN="xxx" TELEGRAM_CHAT_ID="yyy" REPO_URL="https://github.com/mrdqzhf4vk-spec/polybot.git" bash setup_server.sh
 
 set -e
 
@@ -13,7 +13,6 @@ CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 INSTALL_DIR="/opt/polybot"
 SERVICE="polybot"
 
-# ── Checks ────────────────────────────────────────────────────────────────────
 if [[ -z "$REPO_URL" || -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
     echo "ERROR: set REPO_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID before running."
     exit 1
@@ -21,13 +20,12 @@ fi
 
 echo "=== Polybot VPS Setup ==="
 
-# ── System deps ───────────────────────────────────────────────────────────────
 apt-get update -qq
 apt-get install -y -qq python3 python3-pip git curl
 
-pip3 install -q httpx
+# Install httpx — works on Ubuntu 22.04+ and older
+pip3 install httpx --break-system-packages 2>/dev/null || pip3 install httpx
 
-# ── Clone repo ────────────────────────────────────────────────────────────────
 if [[ -d "$INSTALL_DIR" ]]; then
     echo "Updating existing install at $INSTALL_DIR ..."
     git -C "$INSTALL_DIR" fetch origin
@@ -38,7 +36,6 @@ else
     git clone -b "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR"
 fi
 
-# ── Write env file (kept private, not in git) ─────────────────────────────────
 cat > "$INSTALL_DIR/.env" <<EOF
 TELEGRAM_BOT_TOKEN=$BOT_TOKEN
 TELEGRAM_CHAT_ID=$CHAT_ID
@@ -46,7 +43,6 @@ EOF
 chmod 600 "$INSTALL_DIR/.env"
 echo "Credentials saved to $INSTALL_DIR/.env"
 
-# ── Write systemd service ─────────────────────────────────────────────────────
 cat > "/etc/systemd/system/$SERVICE.service" <<EOF
 [Unit]
 Description=Polybot P8 Telegram Signal Bot
@@ -65,7 +61,6 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-# ── Write auto-update timer (pulls from git every 5 min) ─────────────────────
 cat > "/etc/systemd/system/${SERVICE}-updater.service" <<EOF
 [Unit]
 Description=Polybot auto-update from git
@@ -89,7 +84,6 @@ Unit=${SERVICE}-updater.service
 WantedBy=timers.target
 EOF
 
-# ── Enable and start ──────────────────────────────────────────────────────────
 systemctl daemon-reload
 systemctl enable "$SERVICE"
 systemctl start  "$SERVICE"
@@ -100,6 +94,6 @@ echo ""
 echo "=== Done ==="
 echo "Bot status:  systemctl status $SERVICE"
 echo "Live logs:   journalctl -u $SERVICE -f"
-echo "Auto-update: every 5 min from git (${SERVICE}-updater.timer)"
+echo "Auto-update: every 5 min from git"
 echo ""
 echo "Any fix pushed to the repo -> live on server within 5 minutes."
