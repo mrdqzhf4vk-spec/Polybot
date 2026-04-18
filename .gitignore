@@ -1,0 +1,29 @@
+# Secrets — never commit these
+.env
+
+# Runtime data — device-specific, not needed on other machines
+active_session.json
+bot.log
+bot_err.txt
+bot_out.txt
+portfolio_*.json
+memory_hall_of_fame.json
+wallet_names.json
+bot_settings.json
+paper_portfolio.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Old/debug scripts
+old_scripts/
