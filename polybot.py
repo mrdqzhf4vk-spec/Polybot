@@ -184,7 +184,7 @@ class PaperTrader:
         headers = self._live_auth_headers("POST", path, body_str)
         try:
             r = self.session.post(f"https://clob.polymarket.com{path}",
-                                  headers=headers, data=body_str, timeout=8)
+                                  headers=headers, data=body_str, timeout=20)
             r.raise_for_status()
             return r.json()
         except Exception as e:
@@ -785,7 +785,7 @@ class LiveMonitor:
         params = {"user": wallet, "limit": 50, "_t": int(time.time() * 1000)}
 
         try:
-            response = self.session.get(url, params=params, timeout=8)
+            response = self.session.get(url, params=params, timeout=20)
             if response.status_code == 429:
                 print(f"[!] Rate Limited (429) fetching activity for {wallet[:8]}! Slowing down...")
                 return
@@ -814,7 +814,7 @@ class LiveMonitor:
         params = {"user": wallet, "limit": 50, "_t": int(time.time() * 1000)}
 
         try:
-            response = self.session.get(url, params=params, timeout=8)
+            response = self.session.get(url, params=params, timeout=20)
             if response.status_code == 429:
                 print(f"[!] Rate Limited (429) fetching trades for {wallet[:8]}! We might miss fast trades.")
                 return
