@@ -642,6 +642,7 @@ class LiveMonitor:
         def sync_wallet(w):
             print(f"[*] Syncing historical trades for {w[:8]}...")
             self._fetch_latest_trades(w, initial_sync=True)
+            self._fetch_clob_trades(w, initial_sync=True)
             self._fetch_latest_activity(w, initial_sync=True)
 
         with ThreadPoolExecutor(max_workers=10) as executor:
@@ -675,6 +676,7 @@ class LiveMonitor:
                     
                 def poll_wallet(w):
                     self._fetch_latest_trades(w)
+                    self._fetch_clob_trades(w)
                     self._fetch_latest_activity(w)
 
                 # Use persistent executor mapping
@@ -857,6 +859,49 @@ class LiveMonitor:
                 self.seen_trade_ids[wallet] = set(list(seen)[-2000:])
         except Exception as e:
             print(f"[-] Trade Fetch Error: {e}")
+
+    def _fetch_clob_trades(self, wallet: str, initial_sync=False):
+        """Poll CLOB API directly for faster trade detection (less indexing lag)."""
+        try:
+            url = "https://clob.polymarket.com/trades"
+            params = {"maker_address": wallet, "limit": 50}
+            response = self.session.get(url, params=params, timeout=20)
+            if response.status_code != 200:
+                return
+            data = response.json()
+            trades = data if isinstance(data, list) else data.get("data", [])
+            if not trades:
+                return
+
+            seen = self.seen_trade_ids[wallet]
+            backfill_cutoff = time.time() - 1800
+            for trade in reversed(trades):
+                tx_hash = trade.get("transaction_hash", trade.get("transactionHash", ""))
+                market_id = trade.get("market", trade.get("conditionId", ""))
+                trade_id = f"{tx_hash}_{market_id}_clob"
+                if tx_hash and trade_id not in seen:
+                    seen.add(trade_id)
+                    trade_ts = int(trade.get("timestamp", 0))
+                    if initial_sync and trade_ts < backfill_cutoff:
+                        continue
+                    # Normalize to data-api format
+                    side = trade.get("side", "BUY").upper()
+                    price = float(trade.get("price", 0))
+                    size = float(trade.get("size", trade.get("original_size", 0)))
+                    asset = trade.get("asset_id", trade.get("outcome_index", ""))
+                    normalized = {
+                        "transactionHash": tx_hash,
+                        "conditionId": market_id,
+                        "side": side,
+                        "price": price,
+                        "size": size,
+                        "asset": str(asset),
+                        "timestamp": trade_ts,
+                    }
+                    print(f"[*] [CLOB] {'[Backfill] ' if initial_sync else ''}New Trade by {wallet[:8]}: {side} ${price * size:.2f}")
+                    self.traders[wallet].process_new_trade(normalized)
+        except Exception as e:
+            print(f"[-] CLOB Trade Fetch Error: {e}")
 
 
 
