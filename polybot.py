@@ -1383,7 +1383,7 @@ class TelegramController:
 
         def _run():
             self._monitor.start_monitoring(
-                poll_interval_seconds=5,
+                poll_interval_seconds=2,
                 controller=self,
                 stop_event=self._stop_event,
             )
@@ -2009,7 +2009,7 @@ def run_live_monitor():
         return
     wallets = [w.strip() for w in wallets_input.split(',')]
     monitor = LiveMonitor(wallets)
-    monitor.start_monitoring(poll_interval_seconds=5)
+    monitor.start_monitoring(poll_interval_seconds=2)
 
 
 def run_promote_to_live():
@@ -2119,7 +2119,7 @@ def run_promote_to_live():
 
     try:
         monitor = LiveMonitor(wallets_to_track, live_mode=True)
-        monitor.start_monitoring(poll_interval_seconds=5)
+        monitor.start_monitoring(poll_interval_seconds=2)
     except ValueError as e:
         print(f"\n[-] Could not start live mode: {e}")
         print("    Set POLYMARKET_PRIVATE_KEY or POLYMARKET_API_KEY credentials in your .env file and try again.")
@@ -2217,7 +2217,7 @@ def run_auto_pilot():
     
     wallets_to_track = [w['wallet'] for w in winners]
     monitor = LiveMonitor(wallets_to_track)
-    monitor.start_monitoring(poll_interval_seconds=5)
+    monitor.start_monitoring(poll_interval_seconds=2)
 
 
 def main():
