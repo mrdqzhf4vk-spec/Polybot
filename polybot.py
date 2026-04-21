@@ -144,11 +144,11 @@ class PaperTrader:
                 "POLY-TIMESTAMP": ts,
                 "Content-Type": "application/json",
             }
-        else:
-            # API key auth (HMAC-SHA256)
+        elif self._api_secret:
+            # Full API key auth (HMAC-SHA256) — key + secret + passphrase
             msg = ts + method.upper() + path + body
             sig = hmac.new(
-                self._api_secret.encode("utf-8") if self._api_secret else b"",
+                self._api_secret.encode("utf-8"),
                 msg.encode("utf-8"),
                 hashlib.sha256,
             ).hexdigest()
@@ -158,6 +158,14 @@ class PaperTrader:
                 "POLY-TIMESTAMP": ts,
                 "POLY-PASSPHRASE": self._api_passphrase,
                 "POLY-ADDRESS": self._api_address,
+                "Content-Type": "application/json",
+            }
+        else:
+            # API key only (Google/social accounts — no secret/passphrase)
+            return {
+                "POLY-API-KEY": self._api_key,
+                "POLY-ADDRESS": self._api_address,
+                "POLY-TIMESTAMP": ts,
                 "Content-Type": "application/json",
             }
 
