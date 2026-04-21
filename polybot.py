@@ -53,6 +53,9 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+_PROXY_URL = os.getenv("PROXY_URL", "").strip()
+PROXIES = {"http": _PROXY_URL, "https": _PROXY_URL} if _PROXY_URL else None
+
 def send_telegram_alert(message: str):
     """Sends a markdown/HTML formatted message to Telegram if credentials exist."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -532,6 +535,8 @@ class LiveMonitor:
         adapter = requests.adapters.HTTPAdapter(pool_connections=25, pool_maxsize=25)
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
+        if PROXIES:
+            self.session.proxies.update(PROXIES)
 
         # Shared executor for all polling and sweeper tasks
         self.executor = ThreadPoolExecutor(max_workers=min(25, (len(self.target_wallets) * 2) + 1))
@@ -1178,6 +1183,8 @@ class TelegramController:
         self.session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
         self.session.mount("https://", adapter)
+        if PROXIES:
+            self.session.proxies.update(PROXIES)
 
         self.last_update_id = 0
         self._monitor: Optional[LiveMonitor] = None
