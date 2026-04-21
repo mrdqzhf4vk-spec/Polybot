@@ -813,8 +813,17 @@ class LiveMonitor:
         url = f"{self.base_url}/trades"
         params = {"user": wallet, "limit": 50, "_t": int(time.time() * 1000)}
 
+        for attempt in range(3):
+            try:
+                response = self.session.get(url, params=params, timeout=20)
+                break
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                print(f"[-] Trade Fetch Error after 3 attempts: {e}")
+                return
         try:
-            response = self.session.get(url, params=params, timeout=20)
             if response.status_code == 429:
                 print(f"[!] Rate Limited (429) fetching trades for {wallet[:8]}! We might miss fast trades.")
                 return
